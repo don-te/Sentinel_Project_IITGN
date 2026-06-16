@@ -1,22 +1,25 @@
 import os
 import math
 import folium
+from folium import plugins
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-from scipy.spatial import distance_matrix
+from scipy.spatial import cKDTree
 from shapely.geometry import Point
-from branca.element import Template, MacroElement
 
-# Import your working baseline generator
-from labels_to_latlon import OUTPUT_CSV as BASELINE_CSV, convert_labels_to_latlon
-
-# --- CONFIGURATION ---
+# =====================================================================
+# --- CONFIGURATION / PATHS ---
+# Update these paths to match your system if necessary
+# =====================================================================
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 DETECTIONS_PATH = os.path.join(PROJECT_ROOT, "data/detections.csv")
 BOUNDARY_PATH = os.path.join(PROJECT_ROOT, "sentinel_metadata/palwal_boundary.geojson")
 VERIFIED_CSV = os.path.join(PROJECT_ROOT, "data/verified_kilns.csv")
 OUTPUT_HTML = os.path.join(PROJECT_ROOT, "data/palwal_final_map.html")
+
+# NEW: Pointing to the master baseline we just generated
+BASELINE_CSV = os.path.join(PROJECT_ROOT, "data/master_baseline_latlon.csv")
 
 MAP_CENTER = [28.05, 77.28]
 CONFIDENCE_THRESHOLD = 0.60
@@ -36,8 +39,7 @@ def pixel_to_gps(center_lat, center_lon, x_min, y_min, x_max, y_max):
 
 def load_baseline() -> gpd.GeoDataFrame:
     if not os.path.exists(BASELINE_CSV):
-        print(f"{BASELINE_CSV} not found. Building from YOLO/DOTA labels...")
-        convert_labels_to_latlon().to_csv(BASELINE_CSV, index=False)
+        raise FileNotFoundError(f"CRITICAL ERROR: {BASELINE_CSV} not found. Run labels_to_latlon.py first.")
 
     df = pd.read_csv(BASELINE_CSV)
     geometry = [Point(row.longitude, row.latitude) for _, row in df.iterrows()]
@@ -65,7 +67,7 @@ def load_and_fix_predictions() -> gpd.GeoDataFrame:
         
         records.append({
             "image_name": filename,
-            "predicted_class": row.get("predicted_class", "Other"),
+            "predicted_class": row.get("predicted_class", "Other").upper(),
             "confidence": round(float(row["confidence"]), 4),
             "latitude": exact_lat,
             "longitude": exact_lon,
@@ -77,17 +79,21 @@ def verify_predictions(predictions: gpd.GeoDataFrame, baseline: gpd.GeoDataFrame
     if len(predictions) == 0 or len(baseline) == 0:
         return predictions.drop(columns="geometry").copy()
 
-    # Convert to metric for accurate distance calculation
+    # Convert to metric (EPSG:3857) for accurate physical distance calculation
     pred_proj = predictions.to_crs("EPSG:3857")
     base_proj = baseline.to_crs("EPSG:3857")
 
     pred_coords = np.column_stack([pred_proj.geometry.x, pred_proj.geometry.y])
     base_coords = np.column_stack([base_proj.geometry.x, base_proj.geometry.y])
-    distances = distance_matrix(pred_coords, base_coords)
-    nearest_distances = distances.min(axis=1)
+    
+    # UPGRADED: Using cKDTree for lightning-fast nearest neighbor calculation
+    tree = cKDTree(base_coords)
+    distances, indices = tree.query(pred_coords, k=1)
 
     results = predictions.drop(columns="geometry").copy()
-    results["distance_to_nearest_m"] = np.round(nearest_distances, 1)
+    results["distance_to_nearest_m"] = np.round(distances, 1)
+    results["nearest_baseline_class"] = baseline.iloc[indices]["class_name"].values
+    
     results["status"] = np.where(
         results["distance_to_nearest_m"] > DISTANCE_THRESHOLD_M,
         "New Discovery",
@@ -96,73 +102,97 @@ def verify_predictions(predictions: gpd.GeoDataFrame, baseline: gpd.GeoDataFrame
     return results
 
 def build_master_map(baseline: gpd.GeoDataFrame, verified: pd.DataFrame):
-    m = folium.Map(location=MAP_CENTER, zoom_start=11)
+    # Initialize map with Esri Satellite as default
+    m = folium.Map(location=MAP_CENTER, zoom_start=11, control_scale=True)
     
+    # --- UI UPGRADE: Multiple Basemaps ---
     folium.TileLayer(
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
         attr='Esri', name='Esri Satellite', overlay=False, control=True
     ).add_to(m)
+    
+    folium.TileLayer('CartoDB positron', name='Light Map', control=True).add_to(m)
+    folium.TileLayer('OpenStreetMap', name='Street Map', control=True).add_to(m)
 
-    # Boundary
+    # --- UI UPGRADE: Plugins ---
+    plugins.Fullscreen(position="topleft", title="Full Screen", titleCancel="Exit Full Screen").add_to(m)
+    plugins.MiniMap(toggleDisplay=True, position="bottomright").add_to(m)
+
+    # Boundary Layer
     if os.path.exists(BOUNDARY_PATH):
-        folium.GeoJson(BOUNDARY_PATH, name="Palwal Boundary", style_function=lambda _: {"color": "#1f4e79", "weight": 2, "fillOpacity": 0.0}).add_to(m)
+        folium.GeoJson(
+            BOUNDARY_PATH, 
+            name="Palwal Boundary", 
+            style_function=lambda _: {"color": "#1f4e79", "weight": 3, "fillOpacity": 0.05}
+        ).add_to(m)
 
-    # Feature Groups
-    fg_base_fcb = folium.FeatureGroup(name="Baseline: FCBTK")
-    fg_base_zig = folium.FeatureGroup(name="Baseline: Zigzag")
-    fg_base_oth = folium.FeatureGroup(name="Baseline: Clamp/Other")
-    fg_matched = folium.FeatureGroup(name="YOLO: Matched Detections")
-    fg_new = folium.FeatureGroup(name="YOLO: New Discoveries")
+    # Layer Groups for toggling
+    fg_base = folium.FeatureGroup(name="<span style='color: gray;'>Ground Truth (All)</span>", show=True)
+    fg_match = folium.FeatureGroup(name="<span style='color: #2ca02c;'>YOLO: Matched Detections</span>", show=True)
+    fg_new = folium.FeatureGroup(name="<span style='color: #e74c3c;'>YOLO: New Discoveries</span>", show=True)
 
-    # 1. Plot Baseline Kilns (Small, colored dots)
+    # 1. Plot Baseline Kilns (Small gray/white dots)
     for _, row in baseline.iterrows():
-        cls_name = str(row.get('class_name', 'Other')).strip().upper()
-        if 'FCB' in cls_name:
-            color, fg, disp = '#3186cc', fg_base_fcb, "FCBTK"
-        elif 'ZIGZAG' in cls_name:
-            color, fg, disp = '#9b59b6', fg_base_zig, "Zigzag"
-        else:
-            color, fg, disp = '#f39c12', fg_base_oth, "Clamp/Other"
-
+        cls_name = str(row.get('class_name', 'Unknown')).strip().upper()
+        popup_html = f"<b>Ground Truth</b><br>Class: {cls_name}<br>Source: {row.get('split_source', 'N/A')}"
+        
         folium.CircleMarker(
             location=[row.geometry.y, row.geometry.x], radius=4, color="white", weight=1,
-            fill=True, fill_color=color, fill_opacity=0.9,
-            popup=f"<b>Baseline Kiln</b><br>Class: {disp}"
-        ).add_to(fg)
+            fill=True, fill_color="gray", fill_opacity=0.7,
+            popup=folium.Popup(popup_html, max_width=200)
+        ).add_to(fg_base)
 
-    # 2. Plot YOLO Predictions (Green for Match, Bright Red for New)
+    # 2. Plot YOLO Predictions
     for _, row in verified.iterrows():
-        popup = f"<b>{row['status']}</b><br>Class: {row['predicted_class']}<br>Conf: {row['confidence']}<br>Nearest Baseline: {row.get('distance_to_nearest_m', 'N/A')}m"
+        p_class = row['predicted_class']
+        popup_html = f"""
+            <div style='font-family: sans-serif;'>
+                <b>{row['status']}</b><br>
+                <hr style='margin: 3px 0;'>
+                <b>Predicted:</b> {p_class}<br>
+                <b>Confidence:</b> {row['confidence']:.2f}<br>
+                <b>Distance to known:</b> {row.get('distance_to_nearest_m', 'N/A')}m
+            </div>
+        """
         
+        # Color coding by prediction status, styling by class
         if row["status"] == "New Discovery":
-            folium.CircleMarker(
-                location=[row["latitude"], row["longitude"]], radius=6, color="yellow", weight=1.5,
-                fill=True, fill_color="#e74c3c", fill_opacity=1.0, popup=folium.Popup(popup, max_width=300)
-            ).add_to(fg_new)
+            fill_color = "#e74c3c" # Bright Red
+            border_color = "yellow"
+            radius = 7
         else:
-            folium.CircleMarker(
-                location=[row["latitude"], row["longitude"]], radius=5, color="white", weight=1,
-                fill=True, fill_color="#2ca02c", fill_opacity=0.9, popup=folium.Popup(popup, max_width=300)
-            ).add_to(fg_matched)
+            fill_color = "#2ca02c" # Green
+            border_color = "white"
+            radius = 5
 
-    # Add Layers
-    for group in [fg_base_fcb, fg_base_zig, fg_base_oth, fg_matched, fg_new]:
+        folium.CircleMarker(
+            location=[row["latitude"], row["longitude"]], 
+            radius=radius, color=border_color, weight=1.5,
+            fill=True, fill_color=fill_color, fill_opacity=0.9, 
+            popup=folium.Popup(popup_html, max_width=300)
+        ).add_to(fg_new if row["status"] == "New Discovery" else fg_match)
+
+    # Add Layers to map
+    for group in [fg_base, fg_match, fg_new]:
         group.add_to(m)
 
-    # Legend
+    # --- UI UPGRADE: Detailed Floating Legend ---
     legend_html = f'''
-    <div style="position: fixed; bottom: 30px; left: 30px; z-index: 9999; background: rgba(255, 255, 255, 0.95); border: 1px solid #444; border-radius: 6px; padding: 12px; font-size: 13px; box-shadow: 0 2px 8px rgba(0,0,0,0.3);">
-        <b>Sentinel Kiln Map</b><br>
-        <span style="color:#3186cc;">&#9679;</span> Baseline: FCBTK<br>
-        <span style="color:#9b59b6;">&#9679;</span> Baseline: Zigzag<br>
-        <span style="color:#f39c12;">&#9679;</span> Baseline: Clamp/Other<br>
-        <hr style="margin: 4px 0;">
-        <span style="color:#2ca02c;">&#9679;</span> YOLO Match (&le; {DISTANCE_THRESHOLD_M}m)<br>
-        <span style="color:#e74c3c; font-size: 15px; text-shadow: 0px 0px 1px #f1c40f;">&#9679;</span> <b>New Discovery</b> (&gt; {DISTANCE_THRESHOLD_M}m)<br>
+    <div style="position: fixed; bottom: 30px; left: 30px; z-index: 9999; background: rgba(255, 255, 255, 0.95); border: 2px solid grey; border-radius: 8px; padding: 15px; font-size: 14px; box-shadow: 2px 2px 10px rgba(0,0,0,0.3); font-family: Arial, sans-serif;">
+        <h4 style="margin-top: 0; margin-bottom: 10px; border-bottom: 1px solid #ccc; padding-bottom: 5px;"><b>Sentinel Kiln Detections</b></h4>
+        
+        <b>Model Predictions:</b><br>
+        <span style="color:#2ca02c; font-size: 18px;">&#9679;</span> <b>Matched Detection</b> (&le; {DISTANCE_THRESHOLD_M}m)<br>
+        <span style="color:#e74c3c; font-size: 18px; text-shadow: 0px 0px 2px #f1c40f;">&#9679;</span> <b>New Discovery</b> (&gt; {DISTANCE_THRESHOLD_M}m)<br>
+        
+        <hr style="margin: 10px 0;">
+        <b>Reference Data:</b><br>
+        <span style="color:gray; font-size: 16px;">&#9679;</span> Ground Truth Kiln (Train/Val/Test)<br>
     </div>
     '''
     m.get_root().html.add_child(folium.Element(legend_html))
-    folium.LayerControl().add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
+    
     m.save(OUTPUT_HTML)
     print(f"SUCCESS: Master map generated at {OUTPUT_HTML}")
 
@@ -178,11 +208,15 @@ def main():
     os.makedirs(os.path.dirname(VERIFIED_CSV), exist_ok=True)
     verified.to_csv(VERIFIED_CSV, index=False)
     
-    print(f"Baseline kilns: {len(baseline)}")
-    print(f"YOLO detections (>= {CONFIDENCE_THRESHOLD}): {len(predictions)}")
+    print("\n--- RESULTS ---")
+    print(f"Ground truth kilns in region: {len(baseline)}")
+    print(f"Total YOLO detections (conf >= {CONFIDENCE_THRESHOLD}): {len(predictions)}")
     if 'status' in verified.columns:
-        print(f"Matched: {len(verified[verified['status'] == 'Matched Detection'])}")
-        print(f"New Discoveries: {len(verified[verified['status'] == 'New Discovery'])}")
+        matched = len(verified[verified['status'] == 'Matched Detection'])
+        new_disc = len(verified[verified['status'] == 'New Discovery'])
+        print(f"Matched Detections: {matched}")
+        print(f"Actual New Discoveries: {new_disc}")
+        print("-" * 15)
 
     build_master_map(baseline, verified)
 

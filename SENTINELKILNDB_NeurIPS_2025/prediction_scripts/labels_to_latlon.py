@@ -7,34 +7,59 @@ import pandas as pd
 import rasterio
 from shapely.geometry import Point
 
-PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-OUTPUT_CSV = os.path.join(PROJECT_ROOT, "data/baseline_latlon.csv")
-TIF_DIR = os.path.join(PROJECT_ROOT, "data/palwal")
-TILE_METADATA_PATH = os.path.join(PROJECT_ROOT, "sentinel_metadata/palwal_sentinel_metadata.geojson")
-PATCH_METADATA_PATH = os.path.join(PROJECT_ROOT, "sentinel/palwal_metadata.geojson")
+# =====================================================================
+# --- CONFIGURATION / PATHS (Auto-resolved from script location) ---
+# =====================================================================
+# This script automatically finds the project root by going up 2 directories
+# from its location in SENTINELKILNDB_NeurIPS_2025/prediction_scripts/
 
-LABEL_DIR_CANDIDATES = [
-    os.path.join(PROJECT_ROOT, "data/palwal/raw/test/labels"),
-    os.path.join(PROJECT_ROOT, "data/raw/test/yolo_obb_labels"),
-    os.path.join(PROJECT_ROOT, "data/raw/test/dota_labels"),
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+# 1. Output CSV location - will contain all baseline kilns with lat/lon
+OUTPUT_CSV = os.path.join(PROJECT_ROOT, "data/master_baseline_latlon.csv")
+
+# 2. Directory containing Palwal Sentinel-2 TIF images (10m resolution)
+TIF_DIR = os.path.join(PROJECT_ROOT, "data/palwal")
+
+# 3. GeoJSON mapping patches to their Sentinel tiles
+TILE_METADATA_PATH = os.path.join(PROJECT_ROOT, "sentinel_metadata/palwal_sentinel_metadata.geojson")
+
+# 4. Base directories to search for train/val/test label folders
+# Script will recursively search these for label subdirectories
+BASE_DATA_DIRS = [
+    os.path.join(PROJECT_ROOT, "data/raw"),      # Main data splits location
+    os.path.join(PROJECT_ROOT, "data/split"),    # Alternative split location (if labels exist)
 ]
+
+# Expected structure under BASE_DATA_DIRS:
+#   data/raw/train/labels/ (or yolo_obb_labels/ or dota_labels/)
+#   data/raw/val/labels/
+#   data/raw/test/labels/
+
+SPLITS = ["train", "val", "test"]
+LABEL_FOLDER_NAMES = ["labels", "yolo_obb_labels", "dota_labels"]
 
 PALWAL_BBOX = (77.10, 27.85, 77.45, 28.25)
 PATCH_SIZE_PX = 128
 CLASS_NAMES = ["CFCBK", "FCBK", "Zigzag"]
 
 
-def resolve_label_dir() -> tuple[Path, str]:
-    for label_dir in LABEL_DIR_CANDIDATES:
-        path = Path(label_dir)
-        if path.is_dir() and any(path.glob("*.txt")):
-            if "dota_labels" in label_dir:
-                return path, "dota"
-            return path, "yolo_obb"
-    raise FileNotFoundError(
-        "No label directory found. Expected one of: "
-        + ", ".join(LABEL_DIR_CANDIDATES)
-    )
+def get_all_label_dirs() -> list[tuple[Path, str]]:
+    """Finds all valid label directories across train, val, and test splits."""
+    found_dirs = []
+    for base in BASE_DATA_DIRS:
+        for split in SPLITS:
+            for folder_name in LABEL_FOLDER_NAMES:
+                path = Path(base) / split / folder_name
+                if path.is_dir() and any(path.glob("*.txt")):
+                    fmt = "dota" if "dota" in folder_name else "yolo_obb"
+                    found_dirs.append((path, fmt))
+    
+    if not found_dirs:
+        raise FileNotFoundError(
+            f"No label directories found in {BASE_DATA_DIRS} across splits {SPLITS}."
+        )
+    return found_dirs
 
 
 def load_tile_index() -> gpd.GeoDataFrame:
@@ -105,79 +130,107 @@ def obb_to_geo_with_rasterio(
 
 
 def convert_labels_to_latlon() -> pd.DataFrame:
-    label_dir, label_format = resolve_label_dir()
+    label_dirs = get_all_label_dirs()
     tiles = load_tile_index()
     records = []
+    
+    # Prevent duplicate parsing if folders overlap
+    processed_files = set()
 
-    for label_file in sorted(label_dir.glob("*.txt")):
-        patch_lat, patch_lon = map(float, label_file.stem.split("_"))
-        if not (
-            PALWAL_BBOX[0] <= patch_lon <= PALWAL_BBOX[2]
-            and PALWAL_BBOX[1] <= patch_lat <= PALWAL_BBOX[3]
-        ):
-            continue
+    print(f"Scanning {len(label_dirs)} directories for baseline labels across train/val/test...")
 
-        tile_row = find_tile_for_patch(tiles, patch_lat, patch_lon)
-        if tile_row is None:
-            print(f"WARNING: No Sentinel tile found for patch {label_file.name}")
-            continue
-
-        tile_name = tile_row["tile_name"]
-        if not tile_name.endswith(".tif"):
-            tile_name = f"{tile_name}.tif"
-        tif_path = Path(TIF_DIR) / tile_name
-        if not tif_path.exists():
-            print(f"WARNING: Missing TIF for {label_file.name}: {tif_path}")
-            continue
-
-        for line in label_file.read_text().strip().splitlines():
-            if not line.strip():
+    for label_dir, label_format in label_dirs:
+        for label_file in sorted(label_dir.glob("*.txt")):
+            if label_file.name in processed_files:
+                continue
+                
+            try:
+                patch_lat, patch_lon = map(float, label_file.stem.split("_"))
+            except ValueError:
                 continue
 
-            if label_format == "dota":
-                parsed = parse_dota_line(line)
-                if parsed is None:
-                    continue
-                class_name, coords = parsed
-                latitude, longitude = obb_to_geo_with_rasterio(
-                    tif_path, patch_lat, patch_lon, coords, normalized=False
-                )
-            else:
-                parsed = parse_yolo_obb_line(line)
-                if parsed is None:
-                    continue
-                class_id, coords = parsed
-                class_name = CLASS_NAMES[class_id]
-                latitude, longitude = obb_to_geo_with_rasterio(
-                    tif_path, patch_lat, patch_lon, coords, normalized=True
-                )
+            if not (
+                PALWAL_BBOX[0] <= patch_lon <= PALWAL_BBOX[2]
+                and PALWAL_BBOX[1] <= patch_lat <= PALWAL_BBOX[3]
+            ):
+                continue
 
-            records.append(
-                {
-                    "latitude": round(latitude, 7),
-                    "longitude": round(longitude, 7),
-                    "class_name": class_name,
-                    "label_file": label_file.name,
-                    "tile_name": tile_name,
-                    "patch_lat": patch_lat,
-                    "patch_lon": patch_lon,
-                }
-            )
+            tile_row = find_tile_for_patch(tiles, patch_lat, patch_lon)
+            if tile_row is None:
+                # Silencing the print here to prevent console spam since we are parsing ~73,000 files
+                continue
+
+            tile_name = tile_row["tile_name"]
+            if not tile_name.endswith(".tif"):
+                tile_name = f"{tile_name}.tif"
+            tif_path = Path(TIF_DIR) / tile_name
+            if not tif_path.exists():
+                continue
+
+            for line in label_file.read_text().strip().splitlines():
+                if not line.strip():
+                    continue
+
+                if label_format == "dota":
+                    parsed = parse_dota_line(line)
+                    if parsed is None:
+                        continue
+                    class_name, coords = parsed
+                    latitude, longitude = obb_to_geo_with_rasterio(
+                        tif_path, patch_lat, patch_lon, coords, normalized=False
+                    )
+                else:
+                    parsed = parse_yolo_obb_line(line)
+                    if parsed is None:
+                        continue
+                    class_id, coords = parsed
+                    class_name = CLASS_NAMES[class_id]
+                    latitude, longitude = obb_to_geo_with_rasterio(
+                        tif_path, patch_lat, patch_lon, coords, normalized=True
+                    )
+
+                records.append(
+                    {
+                        "latitude": round(latitude, 7),
+                        "longitude": round(longitude, 7),
+                        "class_name": class_name,
+                        "label_file": label_file.name,
+                        "tile_name": tile_name,
+                        "patch_lat": patch_lat,
+                        "patch_lon": patch_lon,
+                        "split_source": label_dir.parent.name # Tracks if it came from train/val/test
+                    }
+                )
+            
+            processed_files.add(label_file.name)
 
     if not records:
         raise RuntimeError(
-            f"No baseline kilns converted from labels in {label_dir}. "
-            "Ensure Palwal-region label files exist."
+            "No baseline kilns converted. Ensure Palwal-region label files exist."
         )
 
     return pd.DataFrame(records)
 
 
 def main() -> None:
+    # Verify critical paths exist before processing
+    required_paths = {
+        "TIF_DIR": TIF_DIR,
+        "TILE_METADATA_PATH": TILE_METADATA_PATH,
+    }
+    
+    for name, path in required_paths.items():
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"{name} does not exist: {path}")
+    
+    print(f"Project Root: {PROJECT_ROOT}")
+    print(f"Output CSV: {OUTPUT_CSV}")
+    print(f"Searching label directories...")
+    
     df = convert_labels_to_latlon()
     os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
     df.to_csv(OUTPUT_CSV, index=False)
-    print(f"Converted {len(df)} baseline kiln points to {OUTPUT_CSV}")
+    print(f"SUCCESS: Converted {len(df)} total baseline kiln points to {OUTPUT_CSV}")
 
 
 if __name__ == "__main__":
