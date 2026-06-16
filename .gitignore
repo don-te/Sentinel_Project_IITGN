@@ -216,3 +216,49 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Image Files
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.webp
+*.svg
+*.ico
+*.psd
+
+# Project-Specific Data & Models
+kiln_env/
+*.pt
+*.pth
+*.onnx
+
+# Data Directories
+data/
+sentinel/
+sentinel_metadata/
+shapes/
+Prompts/
+
+# Generated Outputs
+workspace_results/
+runs/
+wandb/
+
+# Jupyter & Documentation
+*.ipynb
+*.html
+!README.html
+
+# CSV and Geospatial Data
+*.csv
+*.geojson
+
+# Specific Paths
+palwal/
+raw/
+split/
+
