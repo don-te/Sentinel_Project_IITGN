@@ -16,7 +16,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 DETECTIONS_PATH = os.path.join(PROJECT_ROOT, "data/detections.csv")
 BOUNDARY_PATH = os.path.join(PROJECT_ROOT, "sentinel_metadata/palwal_boundary.geojson")
 VERIFIED_CSV = os.path.join(PROJECT_ROOT, "data/verified_kilns.csv")
-OUTPUT_HTML = os.path.join(PROJECT_ROOT, "data/palwal_final_map.html")
+OUTPUT_HTML = os.path.join(PROJECT_ROOT, "data/palwal_foolproof_map.html")
 
 # NEW: Pointing to the master baseline we just generated
 BASELINE_CSV = os.path.join(PROJECT_ROOT, "data/master_baseline_latlon.csv")
@@ -100,6 +100,35 @@ def verify_predictions(predictions: gpd.GeoDataFrame, baseline: gpd.GeoDataFrame
         "Matched Detection",
     )
     return results
+
+def spatial_deduplicate(gdf: gpd.GeoDataFrame, threshold_m: float = 50.0) -> gpd.GeoDataFrame:
+    """Removes redundant points representing the same physical kiln."""
+    if len(gdf) == 0:
+        return gdf
+    
+    # Convert to a metric projection to calculate physical distance in meters
+    metric_gdf = gdf.to_crs("EPSG:3857")
+    coords = np.column_stack([metric_gdf.geometry.x, metric_gdf.geometry.y])
+    
+    # Use cKDTree to find all points within the threshold (e.g., 50 meters)
+    tree = cKDTree(coords)
+    pairs = tree.query_pairs(r=threshold_m)
+    
+    # Greedy approach: If two points are close, drop the second one
+    drop_indices = set()
+    for i, j in pairs:
+        if i not in drop_indices and j not in drop_indices:
+            drop_indices.add(j)
+            
+    keep_indices = [i for i in range(len(gdf)) if i not in drop_indices]
+    
+    original_count = len(gdf)
+    final_count = len(keep_indices)
+    if original_count > final_count:
+        print(f"  -> Deduplication removed {original_count - final_count} redundant overlapping markers.")
+        
+    return gdf.iloc[keep_indices].copy()
+
 
 def build_master_map(baseline: gpd.GeoDataFrame, verified: pd.DataFrame):
     # Initialize map with Esri Satellite as default
@@ -201,22 +230,29 @@ def main():
         print(f"CRITICAL ERROR: {DETECTIONS_PATH} missing.")
         return
 
-    baseline = load_baseline()
-    predictions = load_and_fix_predictions()
+    print("\n--- LOADING & CLEANING BASELINE ---")
+    baseline_raw = load_baseline()
+    baseline = spatial_deduplicate(baseline_raw, threshold_m=50.0)
+
+    print("\n--- LOADING & CLEANING PREDICTIONS ---")
+    predictions_raw = load_and_fix_predictions()
+    predictions = spatial_deduplicate(predictions_raw, threshold_m=50.0)
+
+    print("\n--- VERIFYING DETECTIONS ---")
     verified = verify_predictions(predictions, baseline)
     
     os.makedirs(os.path.dirname(VERIFIED_CSV), exist_ok=True)
     verified.to_csv(VERIFIED_CSV, index=False)
     
-    print("\n--- RESULTS ---")
-    print(f"Ground truth kilns in region: {len(baseline)}")
-    print(f"Total YOLO detections (conf >= {CONFIDENCE_THRESHOLD}): {len(predictions)}")
+    print("\n--- FINAL RESULTS ---")
+    print(f"Unique Ground Truth Kilns: {len(baseline)}")
+    print(f"Unique YOLO Detections (conf >= {CONFIDENCE_THRESHOLD}): {len(predictions)}")
     if 'status' in verified.columns:
         matched = len(verified[verified['status'] == 'Matched Detection'])
         new_disc = len(verified[verified['status'] == 'New Discovery'])
         print(f"Matched Detections: {matched}")
         print(f"Actual New Discoveries: {new_disc}")
-        print("-" * 15)
+        print("-" * 20)
 
     build_master_map(baseline, verified)
 
