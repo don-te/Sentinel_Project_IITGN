@@ -16,7 +16,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..
 DETECTIONS_PATH = os.path.join(PROJECT_ROOT, "data/detections.csv")
 BOUNDARY_PATH = os.path.join(PROJECT_ROOT, "sentinel_metadata/palwal_boundary.geojson")
 VERIFIED_CSV = os.path.join(PROJECT_ROOT, "data/verified_kilns.csv")
-OUTPUT_HTML = os.path.join(PROJECT_ROOT, "data/palwal_foolproof_map.html")
+OUTPUT_HTML = os.path.join(PROJECT_ROOT, "data/palwal_duplicates_rmvd.html")
 
 # NEW: Pointing to the master baseline we just generated
 BASELINE_CSV = os.path.join(PROJECT_ROOT, "data/master_baseline_latlon.csv")
@@ -101,23 +101,31 @@ def verify_predictions(predictions: gpd.GeoDataFrame, baseline: gpd.GeoDataFrame
     )
     return results
 
-def spatial_deduplicate(gdf: gpd.GeoDataFrame, threshold_m: float = 50.0) -> gpd.GeoDataFrame:
-    """Removes redundant points representing the same physical kiln."""
+def spatial_deduplicate(gdf: gpd.GeoDataFrame, threshold_m: float = 150.0) -> gpd.GeoDataFrame:
+    """Removes redundant points representing the same physical kiln, keeping the most confident detection."""
     if len(gdf) == 0:
         return gdf
     
+    # ENHANCEMENT: Sort by confidence descending. 
+    # This guarantees we keep the best bounding box and drop the weaker overlapping ones.
+    if "confidence" in gdf.columns:
+        gdf = gdf.sort_values(by="confidence", ascending=False).reset_index(drop=True)
+    else:
+        gdf = gdf.reset_index(drop=True)
+        
     # Convert to a metric projection to calculate physical distance in meters
     metric_gdf = gdf.to_crs("EPSG:3857")
     coords = np.column_stack([metric_gdf.geometry.x, metric_gdf.geometry.y])
     
-    # Use cKDTree to find all points within the threshold (e.g., 50 meters)
+    # Use cKDTree with the expanded threshold
     tree = cKDTree(coords)
     pairs = tree.query_pairs(r=threshold_m)
     
-    # Greedy approach: If two points are close, drop the second one
+    # Greedy approach: Since the dataframe is sorted, 'i' is always higher confidence than 'j'.
+    # We drop 'j' to keep the better detection.
     drop_indices = set()
     for i, j in pairs:
-        if i not in drop_indices and j not in drop_indices:
+        if i not in drop_indices:
             drop_indices.add(j)
             
     keep_indices = [i for i in range(len(gdf)) if i not in drop_indices]
@@ -125,7 +133,7 @@ def spatial_deduplicate(gdf: gpd.GeoDataFrame, threshold_m: float = 50.0) -> gpd
     original_count = len(gdf)
     final_count = len(keep_indices)
     if original_count > final_count:
-        print(f"  -> Deduplication removed {original_count - final_count} redundant overlapping markers.")
+        print(f"  -> Deduplication (radius {threshold_m}m) removed {original_count - final_count} redundant markers.")
         
     return gdf.iloc[keep_indices].copy()
 
@@ -232,11 +240,11 @@ def main():
 
     print("\n--- LOADING & CLEANING BASELINE ---")
     baseline_raw = load_baseline()
-    baseline = spatial_deduplicate(baseline_raw, threshold_m=50.0)
+    baseline = spatial_deduplicate(baseline_raw, threshold_m=150.0)
 
     print("\n--- LOADING & CLEANING PREDICTIONS ---")
     predictions_raw = load_and_fix_predictions()
-    predictions = spatial_deduplicate(predictions_raw, threshold_m=50.0)
+    predictions = spatial_deduplicate(predictions_raw, threshold_m=150.0)
 
     print("\n--- VERIFYING DETECTIONS ---")
     verified = verify_predictions(predictions, baseline)
